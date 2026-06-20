@@ -1047,7 +1047,7 @@ async function runPipeline() {
 
     setStage(3); // Building captions
     const rawCaptions = Array.isArray(result.captions) ? result.captions : [];
-    state.captions = rawCaptions
+    let parsedCaptions = rawCaptions
       .filter(c => c && typeof c.text === "string" && c.text.trim())
       .map(c => ({
         id: uid(),
@@ -1056,6 +1056,29 @@ async function runPipeline() {
         text: c.text.trim(),
       }))
       .sort((a, b) => a.start - b.start);
+
+    // Sanity check: Gemini occasionally returns timestamps in the wrong unit
+    // (e.g. milliseconds instead of seconds) or with end < start. Detect and
+    // auto-correct common cases so captions still line up with the video.
+    if (parsedCaptions.length && state.duration > 0) {
+      const maxTs = Math.max(...parsedCaptions.map(c => Math.max(c.start, c.end)));
+      if (maxTs > state.duration * 5) {
+        // Looks like milliseconds — convert to seconds.
+        console.warn(`Caption timestamps (max ${maxTs}) far exceed video duration (${state.duration}s) — assuming milliseconds, converting.`);
+        parsedCaptions = parsedCaptions.map(c => ({ ...c, start: c.start / 1000, end: c.end / 1000 }));
+      }
+      // Fix any lines where end <= start (give them a minimum visible duration).
+      parsedCaptions = parsedCaptions.map(c =>
+        c.end <= c.start ? { ...c, end: c.start + 1.5 } : c
+      );
+      // Clamp to video duration so nothing sits outside playable range.
+      parsedCaptions = parsedCaptions.map(c => ({
+        ...c,
+        start: Math.min(c.start, state.duration),
+        end: Math.min(c.end, state.duration),
+      }));
+    }
+    state.captions = parsedCaptions;
     setProgress(100);
 
     if (!state.captions.length) {
@@ -1153,18 +1176,18 @@ function renderCaptionEditor() {
 }
 
 /* live preview sync on the video element */
-function setupCaptionOverlaySync() {
+function videoTimeHandler() {
   const overlay = $("#liveCaptionOverlay");
+  const t = state.videoEl.currentTime;
+  const active = state.captions.find(c => t >= c.start && t <= c.end);
+  overlay.textContent = active ? active.text : "";
+  overlay.style.opacity = active ? "1" : "0";
+}
+function setupCaptionOverlaySync() {
   state.videoEl.removeEventListener("timeupdate", videoTimeHandler);
   state.videoEl.addEventListener("timeupdate", videoTimeHandler);
   applyStyleToOverlay();
-
-  function videoTimeHandler() {
-    const t = state.videoEl.currentTime;
-    const active = state.captions.find(c => t >= c.start && t <= c.end);
-    overlay.textContent = active ? active.text : "";
-    overlay.style.opacity = active ? "1" : "0";
-  }
+  videoTimeHandler(); // run once immediately so the overlay reflects current state right away
 }
 
 function applyStyleToOverlay() {
